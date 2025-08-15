@@ -1,64 +1,76 @@
-import gradio as gr
-from huggingface_hub import InferenceClient
-
-"""
-For more information on `huggingface_hub` Inference API support, please check the docs: https://huggingface.co/docs/huggingface_hub/v0.22.2/en/guides/inference
-"""
-client = InferenceClient("HuggingFaceH4/zephyr-7b-beta")
+import streamlit as st
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 
-def respond(
-    message,
-    history: list[tuple[str, str]],
-    system_message,
-    max_tokens,
-    temperature,
-    top_p,
-):
-    messages = [{"role": "system", "content": system_message}]
+import google.generativeai as genai
+import torch
+import os
 
-    for val in history:
-        if val[0]:
-            messages.append({"role": "user", "content": val[0]})
-        if val[1]:
-            messages.append({"role": "assistant", "content": val[1]})
+# Use GPU if available
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    messages.append({"role": "user", "content": message})
+# Load embedding model (no need to manually assign to device anymore)
+embedding_model = SentenceTransformer("paraphrase-multilingual-mpnet-base-v2")
 
-    response = ""
+# Path to the .pkl file
+POINTS_FILE = "amharic_sentences_points.pkl"
 
-    for message in client.chat_completion(
-        messages,
-        max_tokens=max_tokens,
-        stream=True,
-        temperature=temperature,
-        top_p=top_p,
-    ):
-        token = message.choices[0].delta.content
+# Load precomputed sentence embeddings
+@st.cache_resource
+def load_points():
+    with open(POINTS_FILE, "rb") as f:
+        return pickle.load(f)
 
-        response += token
-        yield response
+points = load_points()
 
+# Local similarity search using cosine similarity
+def local_similarity_search(query, points, limit=15):
+    query_vector = embedding_model.encode(query)
+    vectors = np.array([point["vector"] for point in points])
+    payloads = [point["payload"] for point in points]
+    query_vector = np.array(query_vector)
 
-"""
-For information on how to customize the ChatInterface, peruse the gradio docs: https://www.gradio.app/docs/chatinterface
-"""
-demo = gr.ChatInterface(
-    respond,
-    additional_inputs=[
-        gr.Textbox(value="You are a friendly Chatbot.", label="System message"),
-        gr.Slider(minimum=1, maximum=2048, value=512, step=1, label="Max new tokens"),
-        gr.Slider(minimum=0.1, maximum=4.0, value=0.7, step=0.1, label="Temperature"),
-        gr.Slider(
-            minimum=0.1,
-            maximum=1.0,
-            value=0.95,
-            step=0.05,
-            label="Top-p (nucleus sampling)",
-        ),
-    ],
-)
+    similarities = np.dot(vectors, query_vector) / (
+        np.linalg.norm(vectors, axis=1) * np.linalg.norm(query_vector)
+    )
+
+    top_indices = np.argsort(similarities)[::-1][:limit]
+    results = [
+        {"text": payloads[i]["text"], "score": float(similarities[i])}
+        for i in top_indices
+    ]
+    return results
 
 
-if __name__ == "__main__":
-    demo.launch()
+
+# Summarize using Gemini into one paragraph
+def summarize_with_gemini(matches, query, temperature=2):
+    combined_text = "\n".join([match["text"] for match in matches])
+    prompt = f"""
+    ከዚህ በታች የቀረቡት አንቀጾችን በመመስረት፣ '{query}' ላይ አንድ አንቀጽ ውስጥ ያጠቃልሉ፡፡
+    አጭር አንድ አንቀጽ መልስ ብቻ ይስጡ።
+
+    {combined_text}
+
+    አንድ አንቀጽ መልስ፦
+    """
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(
+        prompt,
+        generation_config={"temperature": temperature}
+    )
+    return response.text.strip()
+
+# Streamlit UI
+st.title("Amharic QA System")
+
+query = st.text_input("የጥያቄዎትን ጽሑፍ ያስገቡ (Enter your Amharic question):")
+
+if query:
+    results = local_similarity_search(query, points, limit=15)
+    summary = summarize_with_gemini(results, query)
+    st.subheader("📝 አጭር መጠቃለያ")
+    st.write(summary)
