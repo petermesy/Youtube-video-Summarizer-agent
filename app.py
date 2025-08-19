@@ -1,76 +1,57 @@
 import streamlit as st
-import pickle
-import numpy as np
-from sentence_transformers import SentenceTransformer
-
-
+from pytube import Search
+from youtube_transcript_api import YouTubeTranscriptApi
 import google.generativeai as genai
-import torch
+import yt_dlp
+import re
 import os
 
-# Use GPU if available
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# 🔑 Set your Google API key (better: use .env file)
+os.environ["GOOGLE_API_KEY"] = "AIzaSyA0a3ld-hCKxrsnTCYZA_aU8JJdENqhHSg"
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Load embedding model (no need to manually assign to device anymore)
-embedding_model = SentenceTransformer("paraphrase-multilingual-mpnet-base-v2")
+# Example: helper functions (replace with your full ones)
+def fetch_transcript(video_id):
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        return " ".join([t["text"] for t in transcript])
+    except Exception:
+        return None
 
-# Path to the .pkl file
-POINTS_FILE = "amharic_sentences_points.pkl"
-
-# Load precomputed sentence embeddings
-@st.cache_resource
-def load_points():
-    with open(POINTS_FILE, "rb") as f:
-        return pickle.load(f)
-
-points = load_points()
-
-# Local similarity search using cosine similarity
-def local_similarity_search(query, points, limit=15):
-    query_vector = embedding_model.encode(query)
-    vectors = np.array([point["vector"] for point in points])
-    payloads = [point["payload"] for point in points]
-    query_vector = np.array(query_vector)
-
-    similarities = np.dot(vectors, query_vector) / (
-        np.linalg.norm(vectors, axis=1) * np.linalg.norm(query_vector)
-    )
-
-    top_indices = np.argsort(similarities)[::-1][:limit]
-    results = [
-        {"text": payloads[i]["text"], "score": float(similarities[i])}
-        for i in top_indices
-    ]
-    return results
-
-
-
-# Summarize using Gemini into one paragraph
-def summarize_with_gemini(matches, query, temperature=2):
-    combined_text = "\n".join([match["text"] for match in matches])
-    prompt = f"""
-    ከዚህ በታች የቀረቡት አንቀጾችን በመመስረት፣ '{query}' ላይ አንድ አንቀጽ ውስጥ ያጠቃልሉ፡፡
-    አጭር አንድ አንቀጽ መልስ ብቻ ይስጡ።
-
-    {combined_text}
-
-    አንድ አንቀጽ መልስ፦
-    """
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-2.0-flash")
+def generate_summary(title, channel, transcript):
     response = model.generate_content(
-        prompt,
-        generation_config={"temperature": temperature}
+        f"Summarize this YouTube video titled '{title}' from {channel}:\n\n{transcript}"
     )
-    return response.text.strip()
+    return response.text
 
-# Streamlit UI
-st.title("Amharic QA System")
+def main():
+    st.set_page_config(page_title="YouTube Summarizer", layout="wide")
+    st.title("🎬 YouTube Video Summarizer")
 
-query = st.text_input("የጥያቄዎትን ጽሑፍ ያስገቡ (Enter your Amharic question):")
+    topic = st.text_input("🔍 Search topic", placeholder="e.g., 'python tutorials'")
+    if topic and st.button("Generate Summaries"):
+        st.info(f"Searching YouTube for: {topic}")
+        search = Search(topic)
+        results = search.results[:5]  # Get top 5 results
+        if not results:
+            st.warning("No videos found for this topic.")
+            return
+        for video in results:
+            video_id = video.video_id
+            title = video.title
+            channel = video.author
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            st.markdown(f"**[{title}]({url})**  ")
+            st.caption(f"Channel: {channel}")
+            # Fetch transcript and summarize
+            transcript = fetch_transcript(video_id)
+            if transcript:
+                with st.expander("Show summary"):
+                    summary = generate_summary(title, channel, transcript)
+                    st.write(summary)
+            else:
+                st.warning("Transcript not available for this video.")
 
-if query:
-    results = local_similarity_search(query, points, limit=15)
-    summary = summarize_with_gemini(results, query)
-    st.subheader("📝 አጭር መጠቃለያ")
-    st.write(summary)
+if __name__ == "__main__":
+    main()
